@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 debug_matches.csv
 failures.csv
+.venv
