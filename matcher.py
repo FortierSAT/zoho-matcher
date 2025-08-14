@@ -370,22 +370,6 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
         finally:
             _release_lock(rid)
 
-    # 5) DEBUG CSV (ephemeral on Render web services—OK for debugging)
-    if debug_rows:
-        debug_path = "debug_matches.csv"
-        with open(debug_path, "w", newline="") as df:
-            fieldnames = list(debug_rows[0].keys())
-            writer = csv.DictWriter(df, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(debug_rows)
-        logger.info(f"Wrote debug CSV: {debug_path}")
-
-    logger.info(f"Done! {len(results)} processed, {len(failures)} failures")
-    if failures:
-        with open("failures.csv","w",newline="") as f:
-            import csv as _csv
-            w = _csv.writer(f); w.writerow(["Result_ID","Reason"]); w.writerows(failures)
-
 # ─── CLI ENTRY ──────────────────────────────────────────────────────────────────
 def _cli():
     p = argparse.ArgumentParser()
