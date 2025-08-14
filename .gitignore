@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+debug_matches.csv
+failures.csv

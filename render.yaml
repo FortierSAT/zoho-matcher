@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: zoho-matcher
+    env: docker
+    plan: free        # or "starter" if you need more
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_ACCOUNTS_BASE
+        value: https://accounts.zoho.com
+      - key: ZOHO_API_BASE
+        value: https://www.zohoapis.com
+      - key: JOB_WORKERS
+        value: "2"
+      - key: LOG_LEVEL
+        value: INFO
