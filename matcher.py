@@ -12,12 +12,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
+def _clean_base(v: str, default: str) -> str:
+    return (v or default).strip().strip('"').strip("'").rstrip('/')
+
 ZOHO_CLIENT_ID        = os.getenv("ZOHO_CLIENT_ID")
 ZOHO_CLIENT_SECRET    = os.getenv("ZOHO_CLIENT_SECRET")
 ZOHO_REFRESH_TOKEN    = os.getenv("ZOHO_REFRESH_TOKEN")
 
-ACCOUNTS_BASE         = os.getenv("ZOHO_ACCOUNTS_BASE", "https://accounts.zoho.com")
-API_BASE              = os.getenv("ZOHO_API_BASE",      "https://www.zohoapis.com")
+ACCOUNTS_BASE         = _clean_base(os.getenv("ZOHO_ACCOUNTS_BASE"), "https://accounts.zoho.com")
+API_BASE              = _clean_base(os.getenv("ZOHO_API_BASE"),      "https://www.zohoapis.com")
 
 RESULTS_MODULE        = os.getenv("RESULTS_MODULE",        "Results_2025")
 SELECTIONS_MODULE     = os.getenv("SELECTIONS_MODULE",     "Random_Selections1")
@@ -27,8 +30,8 @@ PARTICIPANTS_MODULE   = os.getenv("PARTICIPANTS_MODULE",   "Participants")
 SUBFORM_NAME          = os.getenv("SUBFORM_NAME", "Selected_Participants")
 FIELD_BAT             = os.getenv("FIELD_BAT",    "BAT")
 FIELD_CCFID           = os.getenv("FIELD_CCFID",  "CCFID")
-FIELD_COMPLETE        = os.getenv("FIELD_COMPLETE","Completed")  # ← new
-
+FIELD_COMPLETE        = os.getenv("FIELD_COMPLETE","Completed")   # ← subform checkbox API name
+COMPLETE_SCOPE        = os.getenv("COMPLETE_SCOPE", "subform").strip().lower()  # 'subform' (default) or 'parent'
 
 FUZZY_RATIO           = float(os.getenv("FUZZY_RATIO", "0.80"))
 PAGE_SIZE             = int(os.getenv("PAGE_SIZE", "200"))
@@ -55,16 +58,19 @@ class ZohoClient:
 
     def _refresh(self):
         url = f"{ACCOUNTS_BASE}/oauth/v2/token"
-        params = {
+        data = {
             "refresh_token": ZOHO_REFRESH_TOKEN,
             "client_id":     ZOHO_CLIENT_ID,
             "client_secret": ZOHO_CLIENT_SECRET,
-            "grant_type":    "refresh_token"
+            "grant_type":    "refresh_token",
         }
-        r = requests.post(url, params=params, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        self._token = data["access_token"]
+        r = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            logger.error("Zoho token refresh failed %s: %s", r.status_code, r.text[:500])
+            raise
+        self._token = r.json()["access_token"]
 
     def headers(self):
         return {"Authorization": f"Zoho-oauthtoken {self._token}"}
@@ -73,13 +79,20 @@ class ZohoClient:
         if r.status_code == 204:
             raise LookupError(f"No content from {url} (204)")
         ct = r.headers.get("Content-Type", "")
-        if "json" not in ct.lower():
-            # Raise with a peek of the body for debugging (capped to 200 chars)
+        if "json" not in (ct or "").lower():
             raise RuntimeError(f"Unexpected content type {ct} from {url}: {r.text[:200]}")
+
+    # One-shot auto-refresh on 401
+    def _request(self, method, url, **kw):
+        r = requests.request(method, url, headers=kw.pop("headers", self.headers()), timeout=HTTP_TIMEOUT, **kw)
+        if r.status_code == 401:
+            self._refresh()
+            r = requests.request(method, url, headers=self.headers(), timeout=HTTP_TIMEOUT, **kw)
+        return r
 
     def get_record(self, module, record_id):
         url = f"{API_BASE}/crm/v2/{module}/{record_id}"
-        r = requests.get(url, headers=self.headers(), timeout=HTTP_TIMEOUT)
+        r = self._request("GET", url)
         if r.status_code == 404:
             raise LookupError(f"{module} record not found: {record_id}")
         r.raise_for_status()
@@ -92,7 +105,7 @@ class ZohoClient:
     def search(self, module, criteria, page=1):
         url    = f"{API_BASE}/crm/v2/{module}/search"
         params = {"criteria": criteria, "page": page, "per_page": PAGE_SIZE}
-        r = requests.get(url, headers=self.headers(), params=params, timeout=HTTP_TIMEOUT)
+        r = self._request("GET", url, params=params)
         if r.status_code == 204:
             return []
         r.raise_for_status()
@@ -102,13 +115,17 @@ class ZohoClient:
     def update(self, module, record_id, payload):
         url  = f"{API_BASE}/crm/v8/{module}/{record_id}"
         body = {"data": [payload]}
-        r = requests.put(
-            url, headers={**self.headers(), "Content-Type": "application/json"},
-            json=body, timeout=HTTP_TIMEOUT
-        )
+        r = self._request("PUT", url, json=body, headers={**self.headers(), "Content-Type": "application/json"})
         r.raise_for_status()
         self._ensure_json(r, url)
-        return r.json()
+        data = r.json()
+        try:
+            info = data["data"][0]
+            if info.get("status") != "success":
+                logger.error("Update failed for %s %s: %s", module, record_id, info)
+        except Exception:
+            logger.info("Update response (raw): %s", data)
+        return data
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────────────
 def fuzzy_match(a, b):
@@ -163,6 +180,12 @@ def _release_lock(record_id: str):
     except FileNotFoundError:
         pass
 
+def _as_bool(v):
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)): return bool(v)
+    if isinstance(v, str): return v.strip().lower() in {"1","true","yes","on"}
+    return False
+
 # ─── CORE WORK ──────────────────────────────────────────────────────────────────
 def process_results(result_id: str = None, accounts=None, limit: int | None = None):
     client = ZohoClient()
@@ -212,7 +235,7 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
             lookup.append({"id": p["id"], "first": fn, "last": ln})
         participants_by_account[acct] = lookup
 
-    # 3) BOOTSTRAP selections (trimmed; same logic as before)
+    # 3) BOOTSTRAP selections (unchanged logic, minor hygiene)
     bootstrapped = set()
     for sels in account_to_sels.values():
         for sel in sels:
@@ -253,6 +276,7 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                         row["Donor_ID"] = best_id; need = True
                         logger.info(f"  → bootstrapped Donor_ID for '{full}' = {best_id} (score {best_score:.2f})")
 
+                # double-check the API name you intend to write here
                 if not row.get("Company_Name") and company_text:
                     row["Company"] = company_text; need = True
 
@@ -340,40 +364,46 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                         if not ok:
                             continue
 
+                        # Build per-row payload
                         payload = {"id": row_id, update_f: rid}
 
+                        # determine required fields from Test_For (list or ';' string)
                         raw_tests = row.get("Test_For", "")
                         if isinstance(raw_tests, list):
                             tests = [str(t).strip().lower() for t in raw_tests if t]
                         else:
                             tests = [t.strip().lower() for t in str(raw_tests).split(";") if t.strip()]
 
-                        # which fields must be filled
                         required = []
-                        if "drug" in tests:
-                            required.append(FIELD_CCFID)
-                        if "alcohol" in tests:
-                            required.append(FIELD_BAT)
+                        if "drug" in tests:    required.append(FIELD_CCFID)
+                        if "alcohol" in tests: required.append(FIELD_BAT)
 
-                        # simulate the row after this update
+                        # simulate after this update to compute completion
                         simulated = {**row, **payload}
-
-                        # boolean checkbox instead of "State"
                         is_complete = bool(required) and all(simulated.get(f) for f in required)
 
-                        # only send the checkbox if it changes (optional noise reduction)
-                        current_complete = bool(row.get(FIELD_COMPLETE))
-                        if current_complete != is_complete:
-                            payload[FIELD_COMPLETE] = is_complete
+                        if COMPLETE_SCOPE == "parent":
+                            # parent-level checkbox (rare): update on the selection record itself
+                            client.update(SELECTIONS_MODULE, sel["id"], {FIELD_COMPLETE: bool(is_complete)})
+                        else:
+                            # subform-level checkbox (default): set true/false explicitly
+                            payload[FIELD_COMPLETE] = bool(is_complete)
+                            resp = client.update(SELECTIONS_MODULE, sel["id"], { SUBFORM_NAME: [payload] })
+                            # optional: surface per-row errors clearly
+                            try:
+                                info = resp["data"][0]
+                                if info.get("status") != "success":
+                                    logger.error("Subform update failed for sel %s row %s: %s", sel["id"], row_id, info)
+                            except Exception:
+                                pass
 
-                        # push just this subform row
-                        client.update(SELECTIONS_MODULE, sel["id"], { SUBFORM_NAME: [payload] })
-                        row.update(payload)
+                            # keep in-memory row in sync for later checks
+                            row.update(payload)
 
                         matched.add(rid)
                         logger.info(
                             f"→ Matched {rid} → sel {sel['id']} "
-                            f"(row_id={row_id}, idx={idx}, score={best:.2f})"
+                            f"(row_id={row_id}, idx={idx}, score={best:.2f}, complete={bool(is_complete)})"
                         )
                         found = True
                         break
@@ -384,6 +414,7 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                 failures.append((rid, "no match"))
         finally:
             _release_lock(rid)
+
 
 # ─── CLI ENTRY ──────────────────────────────────────────────────────────────────
 def _cli():
