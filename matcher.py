@@ -27,6 +27,8 @@ PARTICIPANTS_MODULE   = os.getenv("PARTICIPANTS_MODULE",   "Participants")
 SUBFORM_NAME          = os.getenv("SUBFORM_NAME", "Selected_Participants")
 FIELD_BAT             = os.getenv("FIELD_BAT",    "BAT")
 FIELD_CCFID           = os.getenv("FIELD_CCFID",  "CCFID")
+FIELD_COMPLETE        = os.getenv("FIELD_COMPLETE","Complete")  # ← new
+
 
 FUZZY_RATIO           = float(os.getenv("FUZZY_RATIO", "0.80"))
 PAGE_SIZE             = int(os.getenv("PAGE_SIZE", "200"))
