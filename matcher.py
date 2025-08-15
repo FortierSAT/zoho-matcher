@@ -341,17 +341,30 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                             continue
 
                         payload = {"id": row_id, update_f: rid}
-                        raw_tests = row.get("Test_For","")
+
+                        raw_tests = row.get("Test_For", "")
                         if isinstance(raw_tests, list):
                             tests = [str(t).strip().lower() for t in raw_tests if t]
                         else:
                             tests = [t.strip().lower() for t in str(raw_tests).split(";") if t.strip()]
+
+                        # which fields must be filled
                         required = []
-                        if "drug"    in tests: required.append(FIELD_CCFID)
-                        if "alcohol" in tests: required.append(FIELD_BAT)
-                        simulated = dict(row); simulated.update(payload)
-                        if all(simulated.get(f) for f in required):
-                            payload["State"] = "Completed"
+                        if "drug" in tests:
+                            required.append(FIELD_CCFID)
+                        if "alcohol" in tests:
+                            required.append(FIELD_BAT)
+
+                        # simulate the row after this update
+                        simulated = {**row, **payload}
+
+                        # boolean checkbox instead of "State"
+                        is_complete = bool(required) and all(simulated.get(f) for f in required)
+
+                        # only send the checkbox if it changes (optional noise reduction)
+                        current_complete = bool(row.get(FIELD_COMPLETE))
+                        if current_complete != is_complete:
+                            payload[FIELD_COMPLETE] = is_complete
 
                         # push just this subform row
                         client.update(SELECTIONS_MODULE, sel["id"], { SUBFORM_NAME: [payload] })
