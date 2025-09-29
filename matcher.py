@@ -6,8 +6,11 @@ import requests
 import datetime
 import argparse
 import re
+import json, time, random
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 
 load_dotenv()
 
@@ -45,18 +48,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── ZOHO CLIENT ────────────────────────────────────────────────────────────────
+# ─── TOKEN CACHE / REFRESH SETTINGS ─────────────────────────────────────────────
+TOKEN_CACHE_PATH   = os.getenv("ZOHO_TOKEN_CACHE", "/tmp/zoho_crm_token.json")
+REFRESH_LOCK_DIR   = os.getenv("ZOHO_REFRESH_LOCK_DIR", "/tmp")
+REFRESH_LOCK_PATH  = os.path.join(REFRESH_LOCK_DIR, "zoho_token_refresh.lock")
+
+RETRY_MAX_TRIES     = int(os.getenv("HTTP_RETRY_MAX_TRIES", "6"))
+RETRY_BASE_SECONDS  = float(os.getenv("HTTP_RETRY_BASE_SECONDS", "0.5"))
+RETRY_MAX_SECONDS   = float(os.getenv("HTTP_RETRY_MAX_SECONDS", "8.0"))
+RETRY_STATUSES      = {429, 500, 502, 503, 504, 520, 522, 524}
+CLOCK_SKEW_PAD_SECS = 30  # refresh a little early to avoid edge-expiry
+
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
+def _now() -> int:
+    return int(time.time())
+
+@contextmanager
+def _file_lock(path: str, timeout: float = 20.0, poll: float = 0.1):
+    """Crude inter-process lock via O_EXCL file creation."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            try:
+                yield
+            finally:
+                try: os.unlink(path)
+                except FileNotFoundError: pass
+            return
+        except FileExistsError:
+            if (time.time() - start) > timeout:
+                raise TimeoutError(f"Could not acquire lock {path} in {timeout}s")
+            time.sleep(poll)
+
+def _read_token_cache():
+    try:
+        with open(TOKEN_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("Failed reading token cache")
+        return None
+
+def _write_token_cache(token: str, expires_in: int | float | None):
+    os.makedirs(os.path.dirname(TOKEN_CACHE_PATH), exist_ok=True)
+    ttl = int(expires_in or 3300)  # Zoho often gives 3600; use 55m if absent
+    payload = {"access_token": token, "expires_at": _now() + ttl}
+    tmp = TOKEN_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, TOKEN_CACHE_PATH)
+
+def _sleep_backoff(attempt: int):
+    base = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    time.sleep(base * (0.5 + random.random()))  # 0.5x–1.5x jitter
+
+# ─── ZOHO CLIENT (robust) ──────────────────────────────────────────────────────
 class ZohoClient:
     def __init__(self):
         for k, v in [("ZOHO_CLIENT_ID", ZOHO_CLIENT_ID), ("ZOHO_CLIENT_SECRET", ZOHO_CLIENT_SECRET), ("ZOHO_REFRESH_TOKEN", ZOHO_REFRESH_TOKEN)]:
             if not v:
                 logger.error(f"Missing {k}. Set it in environment variables.")
                 sys.exit(1)
-        self._token = os.getenv("ZCRM_ACCESS_TOKEN")
-        if not self._token:
-            self._refresh()
+        # Session with connection pooling
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
-    def _refresh(self):
+        self._token, self._expires_at = self._load_or_refresh_token()
+
+    # ——— Token logic ——————————————————————————————————————————————
+    def _load_or_refresh_token(self):
+        cached = _read_token_cache()
+        if cached and cached.get("access_token") and cached.get("expires_at", 0) > (_now() + CLOCK_SKEW_PAD_SECS):
+            return cached["access_token"], cached["expires_at"]
+
+        # Single-flight refresh via lock
+        try:
+            with _file_lock(REFRESH_LOCK_PATH, timeout=25.0, poll=0.15):
+                cached2 = _read_token_cache()
+                if cached2 and cached2.get("access_token") and cached2.get("expires_at", 0) > (_now() + CLOCK_SKEW_PAD_SECS):
+                    return cached2["access_token"], cached2["expires_at"]
+                token, expires_at = self._do_refresh()
+                return token, expires_at
+        except TimeoutError:
+            # Couldn’t get the lock (busy); wait briefly and read cache again
+            time.sleep(1.0)
+            cached3 = _read_token_cache()
+            if cached3 and cached3.get("access_token") and cached3.get("expires_at", 0) > (_now() + CLOCK_SKEW_PAD_SECS):
+                return cached3["access_token"], cached3["expires_at"]
+            token, expires_at = self._do_refresh()
+            return token, expires_at
+
+    def _do_refresh(self):
         url = f"{ACCOUNTS_BASE}/oauth/v2/token"
         data = {
             "refresh_token": ZOHO_REFRESH_TOKEN,
@@ -64,15 +155,37 @@ class ZohoClient:
             "client_secret": ZOHO_CLIENT_SECRET,
             "grant_type":    "refresh_token",
         }
-        r = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            logger.error("Zoho token refresh failed %s: %s", r.status_code, r.text[:500])
-            raise
-        self._token = r.json()["access_token"]
+        for attempt in range(1, RETRY_MAX_TRIES + 1):
+            r = self.session.post(url, data=data, timeout=HTTP_TIMEOUT)
+            if r.status_code in RETRY_STATUSES:
+                logger.warning("Zoho refresh throttled (%s). attempt=%s body=%s", r.status_code, attempt, r.text[:200])
+                if attempt == RETRY_MAX_TRIES:
+                    r.raise_for_status()
+                _sleep_backoff(attempt)
+                continue
+            try:
+                r.raise_for_status()
+            except requests.HTTPError:
+                logger.error("Zoho token refresh failed %s: %s", r.status_code, r.text[:500])
+                raise
+            try:
+                j = r.json()
+            except ValueError:
+                logger.error("Non-JSON token response: %s", r.text[:500])
+                r.raise_for_status()
+                raise
+            token = j["access_token"]
+            expires_in = j.get("expires_in") or j.get("expires_in_sec")
+            _write_token_cache(token, expires_in)
+            return token, _read_token_cache()["expires_at"]
+        raise RuntimeError("Unreachable: refresh retry loop exhausted")
+
+    def _ensure_fresh(self):
+        if self._expires_at <= (_now() + CLOCK_SKEW_PAD_SECS):
+            self._token, self._expires_at = self._load_or_refresh_token()
 
     def headers(self):
+        self._ensure_fresh()
         return {"Authorization": f"Zoho-oauthtoken {self._token}"}
 
     def _ensure_json(self, r, url):
@@ -82,14 +195,37 @@ class ZohoClient:
         if "json" not in (ct or "").lower():
             raise RuntimeError(f"Unexpected content type {ct} from {url}: {r.text[:200]}")
 
-    # One-shot auto-refresh on 401
+    # ——— Robust request with retries + auto-refresh on 401 ————————
     def _request(self, method, url, **kw):
-        r = requests.request(method, url, headers=kw.pop("headers", self.headers()), timeout=HTTP_TIMEOUT, **kw)
-        if r.status_code == 401:
-            self._refresh()
-            r = requests.request(method, url, headers=self.headers(), timeout=HTTP_TIMEOUT, **kw)
-        return r
+        if "headers" not in kw or kw["headers"] is None:
+            kw["headers"] = self.headers()
+        else:
+            # Merge in fresh Authorization without dropping existing headers
+            kw["headers"] = {**kw["headers"], **self.headers()}
 
+        for attempt in range(1, RETRY_MAX_TRIES + 1):
+            r = self.session.request(method, url, timeout=HTTP_TIMEOUT, **kw)
+
+            # Token expired/invalid: refresh then retry once immediately
+            if r.status_code == 401:
+                logger.info("401 received; refreshing token and retrying once")
+                self._token, self._expires_at = self._load_or_refresh_token()
+                current = kw.get("headers") or {}
+                kw["headers"] = {**current, **self.headers()}  # preserve Content-Type etc.
+                r = self.session.request(method, url, timeout=HTTP_TIMEOUT, **kw)
+
+            if r.status_code in RETRY_STATUSES:
+                if attempt == RETRY_MAX_TRIES:
+                    return r
+                logger.warning("Retryable status %s from %s (attempt %s)", r.status_code, url, attempt)
+                _sleep_backoff(attempt)
+                continue
+
+            return r
+
+        return r  # last response
+
+    # ——— Public API ————————————————————————————————————————————————
     def get_record(self, module, record_id):
         url = f"{API_BASE}/crm/v2/{module}/{record_id}"
         r = self._request("GET", url)
@@ -115,7 +251,8 @@ class ZohoClient:
     def update(self, module, record_id, payload):
         url  = f"{API_BASE}/crm/v8/{module}/{record_id}"
         body = {"data": [payload]}
-        r = self._request("PUT", url, json=body, headers={**self.headers(), "Content-Type": "application/json"})
+        hdrs = {**self.headers(), "Content-Type": "application/json"}
+        r = self._request("PUT", url, json=body, headers=hdrs)
         r.raise_for_status()
         self._ensure_json(r, url)
         data = r.json()
@@ -305,7 +442,7 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                 sd = s.get("Selection_Date","")[:10]
                 try:
                     sdt = datetime.datetime.strptime(sd, "%Y-%m-%d").date()
-                except:
+                except Exception:
                     sdt = None
                 full.append({"record": s, "date": sdt, "period": s.get("Selection_Period"), "sel_date": sd})
 
@@ -414,7 +551,6 @@ def process_results(result_id: str = None, accounts=None, limit: int | None = No
                 failures.append((rid, "no match"))
         finally:
             _release_lock(rid)
-
 
 # ─── CLI ENTRY ──────────────────────────────────────────────────────────────────
 def _cli():
